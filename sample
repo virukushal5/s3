@@ -1,0 +1,58 @@
+import boto3
+import time
+from datetime import datetime
+
+logs = boto3.client('logs')
+
+LOG_GROUP = '/aws/ecs/your-log-group'  # Replace or use os.environ.get("LOG_GROUP")
+TOP_N = 5
+
+def lambda_handler(event=None, context=None):
+    now = datetime.utcnow()
+    start_of_day = datetime(now.year, now.month, now.day)
+    start_time = int(start_of_day.timestamp())
+    end_time = int(now.timestamp())
+
+    query = f"""
+    fields @logStream
+    | filter @timestamp >= {start_time * 1000}
+    | stats count() as log_count by @logStream
+    | sort log_count desc
+    | limit {TOP_N}
+    """
+
+    try:
+        response = logs.start_query(
+            logGroupName=LOG_GROUP,
+            startTime=start_time,
+            endTime=end_time,
+            queryString=query,
+        )
+        query_id = response['queryId']
+        print(f"Started query: {query_id}")
+
+        # Wait for completion with timeout
+        timeout = time.time() + 60  # 60 seconds max
+        while True:
+            result = logs.get_query_results(queryId=query_id)
+            if result['status'] == 'Complete':
+                break
+            if time.time() > timeout:
+                print(f"Query timed out: {query_id}")
+                return
+            time.sleep(2)
+
+        # Handle empty results
+        if not result['results']:
+            print("No log data found.")
+            return
+
+        # Output results
+        print("\nTop Log Streams Today:\n")
+        for row in result['results']:
+            log_stream = next(item['value'] for item in row if item['field'] == '@logStream')
+            count = int(next(item['value'] for item in row if item['field'] == 'log_count'))
+            print(f"{log_stream}: {count:,} log events")
+
+    except Exception as e:
+        print(f"Error executing CloudWatch Logs Insights query: {e}")
