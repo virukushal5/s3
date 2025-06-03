@@ -1,0 +1,68 @@
+import boto3
+import time
+from datetime import datetime
+
+logs = boto3.client('logs')
+
+LOG_GROUP_PREFIX = '/aws/ecs'
+TOP_N = 5
+
+def get_log_groups(prefix):
+    log_groups = []
+    paginator = logs.get_paginator('describe_log_groups')
+    for page in paginator.paginate(logGroupNamePrefix=prefix):
+        for group in page.get('logGroups', []):
+            log_groups.append(group['logGroupName'])
+    return log_groups
+
+def run_query_for_log_group(log_group, start_time, end_time):
+    query = f"""
+    fields @logStream
+    | filter @timestamp >= {start_time * 1000}
+    | stats count() as log_count by @logStream
+    | sort log_count desc
+    | limit {TOP_N}
+    """
+
+    response = logs.start_query(
+        logGroupName=log_group,
+        startTime=start_time,
+        endTime=end_time,
+        queryString=query,
+    )
+    query_id = response['queryId']
+    print(f"Started query for {log_group}: {query_id}")
+
+    # Wait for query to complete
+    timeout = time.time() + 60
+    while True:
+        result = logs.get_query_results(queryId=query_id)
+        if result['status'] == 'Complete':
+            return result
+        if time.time() > timeout:
+            print(f"Query timed out for {log_group}.")
+            return None
+        time.sleep(2)
+
+def execute(event=None, context=None):
+    now = datetime.utcnow()
+    start_of_day = datetime(now.year, now.month, now.day)
+    start_time = int(start_of_day.timestamp())
+    end_time = int(now.timestamp())
+
+    log_groups = get_log_groups(LOG_GROUP_PREFIX)
+
+    for log_group in log_groups:
+        result = run_query_for_log_group(log_group, start_time, end_time)
+        if not result or not result['results']:
+            print(f"No log data found for {log_group}.")
+            continue
+
+        print(f"\nTop Log Streams Today for {log_group}:\n")
+        for row in result['results']:
+            log_stream = next(item['value'] for item in row if item['field'] == '@logStream')
+            count = int(next(item['value'] for item in row if item['field'] == 'log_count'))
+            print(f"{log_stream}: {count:,} log events")
+
+# You can test by calling:
+# execute()
