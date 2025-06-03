@@ -1,0 +1,138 @@
+import boto3
+import time
+from datetime import datetime
+
+logs = boto3.client('logs')
+sns = boto3.client('sns')
+
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789012:YourTopicName'  # Replace with your SNS topic ARN
+LOG_GROUP_PREFIX = '/aws/ecs'
+TOP_N = 5
+LOG_THRESHOLD = 1_000_000
+
+def get_ecs_log_groups():
+    """Yield log groups that start with /aws/ecs (excluding /aws/lambda/)."""
+    paginator = logs.get_paginator('describe_log_groups')
+    for page in paginator.paginate():
+        for group in page['logGroups']:
+            log_group_name = group['logGroupName']
+            if log_group_name.startswith(LOG_GROUP_PREFIX):
+                yield log_group_name
+
+def run_count_query(log_group, start_time, end_time):
+    """Run a query to count total log events in the log group."""
+    query = """
+    fields @timestamp
+    | stats count() as log_count
+    """
+    try:
+        response = logs.start_query(
+            logGroupName=log_group,
+            startTime=start_time * 1000,
+            endTime=end_time * 1000,
+            queryString=query
+        )
+        query_id = response['queryId']
+
+        # Wait up to 60 seconds
+        timeout = time.time() + 60
+        while True:
+            result = logs.get_query_results(queryId=query_id)
+            if result['status'] == 'Complete':
+                break
+            if time.time() > timeout:
+                print(f"Query timed out for {log_group}")
+                return 0
+            time.sleep(2)
+
+        if result['results']:
+            return int(result['results'][0][0]['value'])
+        else:
+            return 0
+
+    except Exception as e:
+        print(f"Error querying {log_group}: {e}")
+        return 0
+
+def run_top_log_streams_query(log_group, start_time, end_time, top_n):
+    """Run a query to find top N log streams in a log group."""
+    query = f"""
+    fields @logStream
+    | stats count() as log_count by @logStream
+    | sort log_count desc
+    | limit {top_n}
+    """
+    try:
+        response = logs.start_query(
+            logGroupName=log_group,
+            startTime=start_time * 1000,
+            endTime=end_time * 1000,
+            queryString=query
+        )
+        query_id = response['queryId']
+
+        timeout = time.time() + 60
+        while True:
+            result = logs.get_query_results(queryId=query_id)
+            if result['status'] == 'Complete':
+                break
+            if time.time() > timeout:
+                print(f"Top stream query timed out for {log_group}")
+                return []
+            time.sleep(2)
+
+        top_streams = []
+        for row in result['results']:
+            stream = next(item['value'] for item in row if item['field'] == '@logStream')
+            count = int(next(item['value'] for item in row if item['field'] == 'log_count'))
+            top_streams.append((stream, count))
+        return top_streams
+
+    except Exception as e:
+        print(f"Error fetching top streams for {log_group}: {e}")
+        return []
+
+def send_alert(log_group, count):
+    """Send an SNS alert if the log count exceeds the threshold."""
+    message = (
+        f"High log volume detected in ECS log group.\n\n"
+        f"Log Group: {log_group}\n"
+        f"Event Count Today: {count:,}\n"
+        f"Threshold: {LOG_THRESHOLD:,}\n\n"
+        f"Time: {datetime.utcnow().isoformat()} UTC"
+    )
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="High ECS Log Volume Alert",
+        Message=message
+    )
+    print(f"Alert sent for {log_group} with {count:,} events.")
+
+def lambda_handler(event=None, context=None):
+    now = datetime.utcnow()
+    start_of_day = datetime(now.year, now.month, now.day)
+    start_time = int(start_of_day.timestamp())
+    end_time = int(now.timestamp())
+
+    log_group_counts = []
+
+    print("Scanning ECS log groups...\n")
+    for log_group in get_ecs_log_groups():
+        count = run_count_query(log_group, start_time, end_time)
+        log_group_counts.append((log_group, count))
+        print(f"{log_group}: {count:,} events")
+
+    log_group_counts.sort(key=lambda x: x[1], reverse=True)
+
+    print("\nTop 5 ECS Log Groups by Event Count Today:\n")
+    for log_group, count in log_group_counts[:TOP_N]:
+        print(f"{log_group}: {count:,} events")
+
+        top_streams = run_top_log_streams_query(log_group, start_time, end_time, top_n=TOP_N)
+        print("  Top Log Streams:")
+        for stream, stream_count in top_streams:
+            print(f"    - {stream}: {stream_count:,} events")
+
+    for log_group, count in log_group_counts:
+        if count > LOG_THRESHOLD:
+            send_alert(log_group, count)
