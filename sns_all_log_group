@@ -1,0 +1,113 @@
+import boto3
+import time
+from datetime import datetime
+from collections import defaultdict
+
+logs = boto3.client('logs')
+sns = boto3.client('sns')
+
+LOG_GROUP_PREFIX = '/aws/ecs'
+TOP_N = 5
+LOG_COUNT_THRESHOLD = 100_000
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789012:NotifyMe'  # Replace with your actual SNS topic ARN
+
+def get_log_groups(prefix):
+    log_groups = []
+    paginator = logs.get_paginator('describe_log_groups')
+    for page in paginator.paginate(logGroupNamePrefix=prefix):
+        for group in page.get('logGroups', []):
+            log_groups.append(group['logGroupName'])
+    return log_groups
+
+def run_query(log_group, start_time, end_time):
+    query = f"""
+    fields @logStream
+    | filter @timestamp >= {start_time * 1000}
+    | stats count() as log_count by @logStream
+    """
+
+    response = logs.start_query(
+        logGroupName=log_group,
+        startTime=start_time,
+        endTime=end_time,
+        queryString=query,
+    )
+    query_id = response['queryId']
+
+    # Wait for query to complete
+    timeout = time.time() + 60
+    while True:
+        result = logs.get_query_results(queryId=query_id)
+        if result['status'] == 'Complete':
+            return result['results']
+        if time.time() > timeout:
+            print(f"Query timed out for {log_group}.")
+            return []
+        time.sleep(2)
+
+def send_sns_notification(alerts, group_totals):
+    if not alerts:
+        return
+
+    message_lines = ["The following log groups have exceeded 100,000 log events today:\n"]
+
+    for log_group, count in alerts.items():
+        message_lines.append(f"- {log_group}: {count:,} log events")
+
+    message_lines.append("\nTop 5 Log Groups Today by Total Log Events:\n")
+
+    top_groups = sorted(group_totals.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
+    for log_group, count in top_groups:
+        message_lines.append(f"- {log_group}: {count:,} log events")
+
+    message = "\n".join(message_lines)
+
+    print("Sending consolidated SNS notification...")
+    print(message)
+
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="CloudWatch Log Group Threshold Alert",
+        Message=message
+    )
+
+def execute(event=None, context=None):
+    now = datetime.utcnow()
+    start_of_day = datetime(now.year, now.month, now.day)
+    start_time = int(start_of_day.timestamp())
+    end_time = int(now.timestamp())
+
+    all_counts = defaultdict(int)
+    group_totals = defaultdict(int)
+    threshold_alerts = {}
+
+    log_groups = get_log_groups(LOG_GROUP_PREFIX)
+    if not log_groups:
+        print("No log groups found.")
+        return
+
+    for log_group in log_groups:
+        results = run_query(log_group, start_time, end_time)
+        for row in results:
+            log_stream = next(item['value'] for item in row if item['field'] == '@logStream')
+            count = int(next(item['value'] for item in row if item['field'] == 'log_count'))
+            key = f"{log_group}:{log_stream}"
+            all_counts[key] += count
+            group_totals[log_group] += count
+
+        if group_totals[log_group] >= LOG_COUNT_THRESHOLD:
+            threshold_alerts[log_group] = group_totals[log_group]
+
+    send_sns_notification(threshold_alerts, group_totals)
+
+    if not all_counts:
+        print("No log data found.")
+        return
+
+    print(f"\nTop {TOP_N} Log Groups Today (by total log count):\n")
+    top_groups = sorted(group_totals.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
+    for log_group, count in top_groups:
+        print(f"{log_group}: {count:,} log events")
+
+# To run manually:
+# execute()
